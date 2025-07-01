@@ -1,7 +1,7 @@
 import { VoyageAIClient } from "voyageai";
 import { Context } from "../../../types";
 import { SuperVoyage } from "./voyage";
-const VECTOR_SIZE = 1024;
+import { EmbedRequestInputType } from "voyageai/api/types/EmbedRequestInputType";
 
 export class Embedding extends SuperVoyage {
   protected context: Context;
@@ -11,13 +11,14 @@ export class Embedding extends SuperVoyage {
     this.context = context;
   }
 
-  async createEmbedding(text: string | null): Promise<number[]> {
+  async createEmbedding(text: string | null, inputType: EmbedRequestInputType = "document"): Promise<number[]> {
     if (text === null) {
-      return new Array(VECTOR_SIZE).fill(0);
+      throw new Error("Text is null");
     } else {
       const response = await this.client.embed({
         input: text,
         model: "voyage-large-2-instruct",
+        inputType,
       });
       return (response.data && response.data[0]?.embedding) || [];
     }

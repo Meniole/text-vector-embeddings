@@ -1,5 +1,6 @@
 import { Context } from "../types";
-import { IssuePayload } from "../types/payload";
+import { IssueSimilaritySearchResult } from "../adapters/supabase/helpers/issues";
+import { RestEndpointMethodTypes } from "@octokit/plugin-rest-endpoint-methods";
 
 export interface IssueGraphqlResponse {
   node: {
@@ -24,72 +25,84 @@ export interface IssueGraphqlResponse {
   similarity: number;
 }
 
-const commentBuilder = (matchResultArray: Map<string, Array<string>>): string => {
-  const commentLines: string[] = [">[!NOTE]", ">The following contributors may be suitable for this task:"];
-  matchResultArray.forEach((issues, assignee) => {
-    commentLines.push(`>### [${assignee}](https://www.github.com/${assignee})`);
-    issues.forEach((issue) => {
-      commentLines.push(issue);
-    });
-  });
-  return commentLines.join("\n");
-};
-
-export async function issueMatching(context: Context) {
+/**
+ * Checks if the current issue is a duplicate of an existing issue.
+ * If a similar completed issue is found, it will add a comment to the issue with the assignee(s) of the similar issue.
+ * @param context The context object
+ **/
+export async function issueMatching(context: Context<"issues.opened" | "issues.edited" | "issues.labeled">) {
   const {
     logger,
     adapters: { supabase },
     octokit,
+    payload,
   } = context;
-  const { payload } = context as { payload: IssuePayload };
   const issue = payload.issue;
   const issueContent = issue.body + issue.title;
   const commentStart = ">The following contributors may be suitable for this task:";
-
-  // On Adding the labels to the issue, the bot should
-  // create a new comment with users who completed task most similar to the issue
-  // if the comment already exists, it should update the comment with the new users
   const matchResultArray: Map<string, Array<string>> = new Map();
-  const similarIssues = await supabase.issue.findSimilarIssues(issueContent, context.config.jobMatchingThreshold, issue.node_id);
+
+  // If alwaysRecommend is enabled, use a lower threshold to ensure we get enough recommendations
+  const threshold = context.config.alwaysRecommend && context.config.alwaysRecommend > 0 ? 0 : context.config.jobMatchingThreshold;
+
+  const similarIssues = await supabase.issue.findSimilarIssuesToMatch({
+    markdown: issueContent,
+    threshold: threshold,
+    currentId: issue.node_id,
+  });
+
   if (similarIssues && similarIssues.length > 0) {
-    // Find the most similar issue and the users who completed the task
-    similarIssues.sort((a, b) => b.similarity - a.similarity);
-    const fetchPromises = similarIssues.map(async (issue) => {
-      const issueObject: IssueGraphqlResponse = await context.octokit.graphql(
-        `query ($issueNodeId: ID!) {
-            node(id: $issueNodeId) {
-              ... on Issue {
-                title
-                url
-                state
-                repository{
-                  name
-                  owner {
-                    login
+    similarIssues.sort((a: IssueSimilaritySearchResult, b: IssueSimilaritySearchResult) => b.similarity - a.similarity); // Sort by similarity
+    const fetchPromises = similarIssues.map(async (issue: IssueSimilaritySearchResult) => {
+      try {
+        const issueObject: IssueGraphqlResponse = await context.octokit.graphql(
+          /* GraphQL */
+          `
+            query ($issueNodeId: ID!) {
+              node(id: $issueNodeId) {
+                ... on Issue {
+                  title
+                  url
+                  state
+                  repository {
+                    name
+                    owner {
+                      login
+                    }
                   }
-                }
-                stateReason
-                closed
-                assignees(first: 10) {
-                  nodes {
-                    login
-                    url
+                  stateReason
+                  closed
+                  assignees(first: 10) {
+                    nodes {
+                      login
+                      url
+                    }
                   }
                 }
               }
             }
-          }`,
-        { issueNodeId: issue.issue_id }
-      );
-      issueObject.similarity = issue.similarity;
-      return issueObject;
+          `,
+          { issueNodeId: issue.issue_id }
+        );
+        issueObject.similarity = issue.similarity;
+        return issueObject;
+      } catch (error) {
+        context.logger.error(`Failed to fetch issue ${issue.issue_id}: ${error}`, { issue });
+        return null;
+      }
     });
+    const issueList = await Promise.allSettled(fetchPromises);
 
-    const issueList = await Promise.all(fetchPromises);
-    issueList.forEach((issue) => {
+    logger.debug("Fetched similar issues", { issueList });
+    issueList.forEach((issuePromise: PromiseSettledResult<IssueGraphqlResponse | null>) => {
+      if (!issuePromise || issuePromise.status === "rejected" || !issuePromise.value) {
+        return;
+      }
+      const issue = issuePromise.value as IssueGraphqlResponse;
+      // Only use completed issues that have assignees
       if (issue.node.closed && issue.node.stateReason === "COMPLETED" && issue.node.assignees.nodes.length > 0) {
         const assignees = issue.node.assignees.nodes;
-        assignees.forEach((assignee) => {
+        assignees.forEach((assignee: { login: string; url: string }) => {
           const similarityPercentage = Math.round(issue.similarity * 100);
           const issueLink = issue.node.url.replace(/https?:\/\/github.com/, "https://www.github.com");
           if (matchResultArray.has(assignee.login)) {
@@ -106,37 +119,59 @@ export async function issueMatching(context: Context) {
         });
       }
     });
+
     // Fetch if any previous comment exists
-    const listIssues = await octokit.issues.listComments({
+    const listIssues: RestEndpointMethodTypes["issues"]["listComments"]["response"] = await octokit.rest.issues.listComments({
       owner: payload.repository.owner.login,
       repo: payload.repository.name,
       issue_number: issue.number,
     });
     //Check if the comment already exists
     const existingComment = listIssues.data.find((comment) => comment.body && comment.body.includes(">[!NOTE]" + "\n" + commentStart));
-    //Check if matchResultArray is empty
-    if (matchResultArray && matchResultArray.size === 0) {
+
+    logger.debug("Matched issues", { matchResultArray, length: matchResultArray.size });
+
+    if (matchResultArray.size === 0) {
       if (existingComment) {
         // If the comment already exists, delete it
-        await octokit.issues.deleteComment({
+        await octokit.rest.issues.deleteComment({
           owner: payload.repository.owner.login,
           repo: payload.repository.name,
           comment_id: existingComment.id,
         });
       }
-      logger.debug("No similar issues found");
+      logger.debug("No suitable contributors found");
       return;
     }
-    const comment = commentBuilder(matchResultArray);
+
+    // Convert Map to array and sort by highest similarity
+    const sortedContributors = Array.from(matchResultArray.entries())
+      .map(([login, matches]) => ({
+        login,
+        matches,
+        maxSimilarity: Math.max(...matches.map((match) => parseInt(match.match(/`(\d+)% Match`/)?.[1] || "0"))),
+      }))
+      .sort((a, b) => b.maxSimilarity - a.maxSimilarity);
+
+    logger.debug("Sorted contributors", { sortedContributors });
+
+    // Use alwaysRecommend if specified
+    const numToShow = context.config.alwaysRecommend || 3;
+    const limitedContributors = new Map(sortedContributors.slice(0, numToShow).map(({ login, matches }) => [login, matches]));
+
+    const comment = commentBuilder(limitedContributors);
+
+    logger.debug("Comment to be added", { comment });
+
     if (existingComment) {
-      await context.octokit.issues.updateComment({
+      await context.octokit.rest.issues.updateComment({
         owner: payload.repository.owner.login,
         repo: payload.repository.name,
         comment_id: existingComment.id,
         body: comment,
       });
     } else {
-      await context.octokit.issues.createComment({
+      await context.octokit.rest.issues.createComment({
         owner: payload.repository.owner.login,
         repo: payload.repository.name,
         issue_number: payload.issue.number,
@@ -145,6 +180,21 @@ export async function issueMatching(context: Context) {
     }
   }
 
-  logger.ok(`Successfully created issue comment!`);
-  logger.debug(`Exiting issueMatching handler`);
+  logger.info(`Exiting issueMatching handler!`, { similarIssues: similarIssues || "No similar issues found" });
+}
+
+/**
+ * Builds the comment to be added to the issue
+ * @param matchResultArray The array of issues to be matched
+ * @returns The comment to be added to the issue
+ */
+function commentBuilder(matchResultArray: Map<string, Array<string>>): string {
+  const commentLines: string[] = [">[!NOTE]", ">The following contributors may be suitable for this task:"];
+  matchResultArray.forEach((issues: Array<string>, assignee: string) => {
+    commentLines.push(`>### [${assignee}](https://www.github.com/${assignee})`);
+    issues.forEach((issue: string) => {
+      commentLines.push(issue);
+    });
+  });
+  return commentLines.join("\n");
 }
