@@ -1,4 +1,4 @@
-import { Context } from "../../src/types";
+import { Context } from "../../src/types/index";
 import { Comment, CommentData } from "../../src/adapters/supabase/helpers/comment";
 import { STRINGS } from "./strings";
 import { jest } from "@jest/globals";
@@ -84,7 +84,8 @@ export function createMockAdapters(context: Context) {
 
       issue: {
         getIssue: jest.fn(async (issueId: string) => {
-          return issueMap.get(issueId) || null;
+          if (!issueMap.has(issueId)) return null;
+          return issueMap.get(issueId);
         }),
         findSimilarIssues: jest.fn(async (issueContent: string, threshold: number, currentIssueId: string) => {
           // Return empty array for first issue in each test
@@ -125,6 +126,9 @@ export function createMockAdapters(context: Context) {
         createIssue: jest.fn(async (issue: IssueData) => {
           issueMap.set(issue.id, issue);
         }),
+        updateIssue: jest.fn(async (issue: IssueData) => {
+          issueMap.set(issue.id, issue);
+        }),
       },
       fetchComments: jest.fn(async (issueId: string) => {
         return Array.from(commentMap.values()).filter((comment) => comment.issue_id === issueId);
@@ -139,6 +143,9 @@ export function createMockAdapters(context: Context) {
           return new Array(3072).fill(0);
         }),
       } as unknown as number[],
+    },
+    kv: {
+      addIssue: jest.fn(),
     },
   };
 }
