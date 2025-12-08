@@ -48,5 +48,6 @@
       }
     }
   },
-  "homepage_url": "https://text-vector-embeddings-mai.deno.dev"
+  "homepage_url": "https://text-vector-embeddings-mai.deno.dev",
+  "short_name": "Meniole/text-vector-embeddings@main"
 }
