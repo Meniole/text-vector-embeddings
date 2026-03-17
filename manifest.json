@@ -94,5 +94,6 @@
         "type": "boolean"
       }
     }
-  }
+  },
+  "homepage_url": "https://meniole-text-vector-embedd.deno.dev"
 }
